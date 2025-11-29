@@ -1,0 +1,5 @@
+{
+  "name": "FramePerfect AI",
+  "description": "An AI-powered workflow to extract, grade, and curate high-quality still frames from video footage using Google Gemini.",
+  "requestFramePermissions": []
+}

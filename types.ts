@@ -39,6 +39,7 @@ export interface VideoFrame {
   isProcessing: boolean;
   enhancedUrl?: string; // URL of the AI enhanced version
   isEnhancing?: boolean;
+  appliedEnhancements?: string[]; // History of applied effects
 }
 
 export interface FilterState {

@@ -3,26 +3,29 @@ import { Button } from './components/Button';
 import { FrameCard } from './components/FrameCard';
 import { DetailModal } from './components/DetailModal';
 import { EnhanceOptionsModal } from './components/EnhanceOptionsModal';
+import { PipelineStatus } from './components/PipelineStatus';
 import { analyzeFrameWithGemini, enhanceFrameWithGemini } from './services/geminiService';
 import { exportProjectToZip } from './services/exportService';
+import { saveProject, loadProject, clearProject } from './services/storageService';
 import { VideoFrame, FrameQuality, FilterState, ProcessingStats, ShotType, ScanSettings, EnhancementType } from './types';
-
-const STORAGE_KEY = 'frameperfect_state_v3';
 
 export default function App() {
   const [videoFile, setVideoFile] = useState<File | null>(null);
   const [videoUrl, setVideoUrl] = useState<string | null>(null);
+  const [videoDuration, setVideoDuration] = useState<number>(0);
   const [projectName, setProjectName] = useState('My Project');
   const [frames, setFrames] = useState<VideoFrame[]>([]);
   const [isExtracting, setIsExtracting] = useState(false);
   const [extractionProgress, setExtractionProgress] = useState(0);
   const [selectedFrameId, setSelectedFrameId] = useState<string | null>(null);
-  const [enhancingFrameId, setEnhancingFrameId] = useState<string | null>(null); // For single Enhancement Modal
-  const [isBatchEnhancing, setIsBatchEnhancing] = useState(false); // For Batch Modal
+  const [isBatchEnhancing, setIsBatchEnhancing] = useState(false);
   const [isExporting, setIsExporting] = useState(false);
   
-  // New States
+  // UI States
   const [showFilters, setShowFilters] = useState(false);
+  const [libraryView, setLibraryView] = useState<'all' | 'library'>('all'); // Main view toggle
+  const [libraryFilter, setLibraryFilter] = useState<'all' | 'enhanced' | 'original'>('all'); // Sub-filter for library
+
   const [scanSettings, setScanSettings] = useState<ScanSettings>({
     range: 'full',
     interval: 3,
@@ -37,15 +40,13 @@ export default function App() {
   const videoRef = useRef<HTMLVideoElement>(null);
   const canvasRef = useRef<HTMLCanvasElement>(null);
 
-  // Load from LocalStorage
+  // Load from IndexedDB on mount
   useEffect(() => {
-    const saved = localStorage.getItem(STORAGE_KEY);
-    if (saved) {
+    const initLoad = async () => {
       try {
-        const parsed = JSON.parse(saved);
-        if (Array.isArray(parsed)) {
-          // Sanitize
-          const sanitizedFrames = parsed.map((f: any) => ({
+        const loadedFrames = await loadProject();
+        if (loadedFrames && loadedFrames.length > 0) {
+           const sanitizedFrames = loadedFrames.map((f: any) => ({
             ...f,
             analysis: f.analysis ? {
               ...f.analysis,
@@ -53,21 +54,23 @@ export default function App() {
               people: f.analysis.people || [],
               technicalAdvice: f.analysis.technicalAdvice || "No advice available",
               compositionScore: f.analysis.compositionScore ?? 5,
-            } : null
+            } : null,
+            appliedEnhancements: f.appliedEnhancements || []
           }));
           setFrames(sanitizedFrames);
-          if (sanitizedFrames.length > 0) setVideoUrl("restored"); 
+          setVideoUrl("restored");
         }
       } catch (e) {
-        localStorage.removeItem(STORAGE_KEY);
+        console.error("Failed to load project from DB", e);
       }
-    }
+    };
+    initLoad();
   }, []);
 
-  // Save to LocalStorage
+  // Save to IndexedDB whenever frames change
   useEffect(() => {
     if (frames.length > 0) {
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(frames));
+      saveProject(frames).catch(e => console.error("Failed to save to DB", e));
     }
   }, [frames]);
 
@@ -88,7 +91,31 @@ export default function App() {
     return Array.from(allTags).slice(0, 8);
   }, [frames]);
 
-  const handleFileChange = (event: React.ChangeEvent<HTMLInputElement>) => {
+  const formatDuration = (seconds: number) => {
+    const m = Math.floor(seconds / 60);
+    const s = Math.floor(seconds % 60);
+    return `${m.toString().padStart(2, '0')}:${s.toString().padStart(2, '0')}`;
+  };
+
+  const getScanRangeLabel = () => {
+    if (videoDuration === 0) return "";
+    let start = 0;
+    let end = videoDuration;
+    let label = "Full Video";
+
+    switch (scanSettings.range) {
+        case 'first_half': end = videoDuration / 2; label = "First Half"; break;
+        case 'second_half': start = videoDuration / 2; label = "Second Half"; break;
+        case 'q1': end = videoDuration * 0.25; label = "Q1"; break;
+        case 'q2': start = videoDuration * 0.25; end = videoDuration * 0.5; label = "Q2"; break;
+        case 'q3': start = videoDuration * 0.5; end = videoDuration * 0.75; label = "Q3"; break;
+        case 'q4': start = videoDuration * 0.75; label = "Q4"; break;
+    }
+
+    return `(${label}: ${formatDuration(start)} - ${formatDuration(end)})`;
+  };
+
+  const handleFileChange = async (event: React.ChangeEvent<HTMLInputElement>) => {
     const file = event.target.files?.[0];
     if (file) {
       setVideoFile(file);
@@ -96,7 +123,8 @@ export default function App() {
       setVideoUrl(url);
       setFrames([]); 
       setFilters({ minQuality: 'All', shotType: 'All', activeTags: [] });
-      localStorage.removeItem(STORAGE_KEY);
+      setVideoDuration(0);
+      await clearProject();
     }
   };
 
@@ -125,7 +153,6 @@ export default function App() {
 
     const duration = video.duration;
     
-    // Determine Scan Range
     let startTime = 0;
     let endTime = duration;
     
@@ -136,7 +163,7 @@ export default function App() {
         case 'q2': startTime = duration * 0.25; endTime = duration * 0.5; break;
         case 'q3': startTime = duration * 0.5; endTime = duration * 0.75; break;
         case 'q4': startTime = duration * 0.75; break;
-        default: break; // full
+        default: break;
     }
 
     const width = video.videoWidth;
@@ -149,7 +176,6 @@ export default function App() {
     let currentTime = startTime;
     const interval = Math.max(1, scanSettings.interval);
     
-    // Safety break loop
     const maxFrames = 50; 
     let count = 0;
 
@@ -167,6 +193,7 @@ export default function App() {
         analysis: null,
         isSelected: false,
         isProcessing: true,
+        appliedEnhancements: []
       };
 
       setFrames(prev => [...prev, newFrame]);
@@ -198,60 +225,79 @@ export default function App() {
     }
   };
 
-  const handleEnhanceSelection = async (type: EnhancementType) => {
-    if (isBatchEnhancing) {
-      await handleBatchEnhance(type);
-      return;
+  const handleEnhanceSelection = async (frame: VideoFrame, advice: string, type: EnhancementType | EnhancementType[]) => {
+    setFrames(curr => curr.map(f => f.id === frame.id ? { ...f, isEnhancing: true } : f));
+
+    try {
+      // Handle both single and array types for backward compatibility or direct calls
+      const types = Array.isArray(type) ? type : [type];
+      const enhancedBase64 = await enhanceFrameWithGemini(frame.imageUrl, advice, types);
+
+      setFrames(curr => curr.map(f => {
+        if (f.id === frame.id) {
+          return { 
+            ...f, 
+            isEnhancing: false, 
+            enhancedUrl: enhancedBase64 || undefined,
+            isSelected: true,
+            appliedEnhancements: [...(f.appliedEnhancements || []), ...types.map(t => t.toString())], 
+            analysis: f.analysis ? { ...f.analysis, quality: FrameQuality.EXCELLENT } : null
+          };
+        }
+        return f;
+      }));
+    } catch (error) {
+       console.error("Enhancement failed", error);
+       setFrames(curr => curr.map(f => f.id === frame.id ? { ...f, isEnhancing: false } : f));
     }
+  };
 
-    const frameId = enhancingFrameId;
-    if (!frameId) return;
+  const handleSaveVersion = async (frame: VideoFrame) => {
+    if (!frame.enhancedUrl) return;
 
-    setEnhancingFrameId(null); // Close modal
-    
-    const frame = frames.find(f => f.id === frameId);
-    if (!frame || !frame.analysis) return;
+    // Create a new frame entry from the enhanced version
+    const newFrame: VideoFrame = {
+        id: crypto.randomUUID(),
+        timestamp: frame.timestamp,
+        imageUrl: frame.enhancedUrl, // The enhanced image becomes the base for the new frame
+        analysis: frame.analysis ? { ...frame.analysis, quality: FrameQuality.EXCELLENT } : null,
+        isSelected: true,
+        isProcessing: false,
+        isEnhancing: false,
+        appliedEnhancements: frame.appliedEnhancements,
+        enhancedUrl: undefined // Reset enhanced URL for the new frame so it can be enhanced again
+    };
 
-    setFrames(curr => curr.map(f => f.id === frameId ? { ...f, isEnhancing: true } : f));
-
-    // Pass the specific enhancement type
-    const enhancedBase64 = await enhanceFrameWithGemini(frame.imageUrl, frame.analysis.technicalAdvice, type);
-
-    setFrames(curr => curr.map(f => {
-      if (f.id === frameId) {
-        return { 
-          ...f, 
-          isEnhancing: false, 
-          enhancedUrl: enhancedBase64 || undefined,
-          isSelected: true 
-        };
-      }
-      return f;
-    }));
+    setFrames(prev => [newFrame, ...prev]);
+    // Note: We don't close the modal, allowing the user to continue editing the original if they want
+    alert("Enhanced version saved to library as a new frame!");
   };
 
   const handleBatchEnhance = async (type: EnhancementType) => {
     setIsBatchEnhancing(false);
     
-    // Set loading state for all selected
     const targetIds = selectedFrames.map(f => f.id);
     setFrames(curr => curr.map(f => targetIds.includes(f.id) ? { ...f, isEnhancing: true } : f));
 
-    // Process sequentially to be gentle on rate limits
     for (const frame of selectedFrames) {
         if (!frame.analysis) continue;
-        const enhancedBase64 = await enhanceFrameWithGemini(frame.imageUrl, frame.analysis.technicalAdvice, type);
-        
-        setFrames(curr => curr.map(f => {
-            if (f.id === frame.id) {
-                return { 
-                    ...f, 
-                    isEnhancing: false, 
-                    enhancedUrl: enhancedBase64 || undefined,
-                };
-            }
-            return f;
-        }));
+        try {
+            const enhancedBase64 = await enhanceFrameWithGemini(frame.imageUrl, frame.analysis.technicalAdvice, [type]);
+            setFrames(curr => curr.map(f => {
+                if (f.id === frame.id) {
+                    return { 
+                        ...f, 
+                        isEnhancing: false, 
+                        enhancedUrl: enhancedBase64 || undefined,
+                        analysis: f.analysis ? { ...f.analysis, quality: FrameQuality.EXCELLENT } : null,
+                        appliedEnhancements: [...(f.appliedEnhancements || []), type],
+                    };
+                }
+                return f;
+            }));
+        } catch (e) {
+            setFrames(curr => curr.map(f => f.id === frame.id ? { ...f, isEnhancing: false } : f));
+        }
     }
   };
 
@@ -292,9 +338,20 @@ export default function App() {
   };
 
   const filteredFrames = frames.filter(frame => {
+    // 1. Library View Filter (Keepers Only)
+    if (libraryView === 'library') {
+        if (!frame.isSelected) return false;
+    }
+
+    // 2. Sub-filter (Enhanced vs Original)
+    if (libraryFilter === 'enhanced' && !frame.appliedEnhancements?.length) return false;
+    if (libraryFilter === 'original' && frame.appliedEnhancements?.length) return false;
+
+    // 3. Extraction / Processing Check
     if (!frame.analysis && isExtracting) return true;
     if (!frame.analysis) return false;
 
+    // 4. Quality & Tag Filters
     if (filters.minQuality !== 'All') {
       const qualityOrder = { [FrameQuality.FAIR]: 1, [FrameQuality.GOOD]: 2, [FrameQuality.EXCELLENT]: 3, [FrameQuality.PENDING]: 0 };
       if (qualityOrder[frame.analysis.quality] < qualityOrder[filters.minQuality]) return false;
@@ -308,35 +365,39 @@ export default function App() {
   });
 
   const selectedFrame = frames.find(f => f.id === selectedFrameId);
-  const enhancingFrame = frames.find(f => f.id === enhancingFrameId);
   const selectedIndex = filteredFrames.findIndex(f => f.id === selectedFrameId);
 
   return (
     <div className="min-h-screen bg-gray-950 text-gray-200 flex flex-col font-sans pb-20">
-      <video ref={videoRef} src={videoUrl && videoUrl !== 'restored' ? videoUrl : ""} className="hidden" crossOrigin="anonymous" muted playsInline />
+      <video 
+        ref={videoRef} 
+        src={videoUrl && videoUrl !== 'restored' ? videoUrl : ""} 
+        className="hidden" 
+        crossOrigin="anonymous" 
+        muted 
+        playsInline 
+        onLoadedMetadata={(e) => setVideoDuration(e.currentTarget.duration)}
+      />
       <canvas ref={canvasRef} className="hidden" />
 
-      {/* Modal: Full Detail View */}
+      {/* Modal */}
       {selectedFrame && (
         <DetailModal 
           frame={selectedFrame} 
           onClose={() => setSelectedFrameId(null)} 
-          onEnhance={() => setEnhancingFrameId(selectedFrame.id)} 
+          onEnhance={handleEnhanceSelection} 
+          onSaveVersion={handleSaveVersion}
           onToggleSelect={toggleFrameSelection}
           onNext={selectedIndex < filteredFrames.length - 1 ? () => setSelectedFrameId(filteredFrames[selectedIndex + 1].id) : undefined}
           onPrev={selectedIndex > 0 ? () => setSelectedFrameId(filteredFrames[selectedIndex - 1].id) : undefined}
         />
       )}
 
-      {/* Modal: Enhancement Options (Single or Batch) */}
-      {(enhancingFrame || isBatchEnhancing) && (
+      {/* Batch Modal */}
+      {isBatchEnhancing && (
         <EnhanceOptionsModal 
-          frame={enhancingFrame}
-          onClose={() => {
-            setEnhancingFrameId(null);
-            setIsBatchEnhancing(false);
-          }}
-          onSelect={handleEnhanceSelection}
+          onClose={() => setIsBatchEnhancing(false)}
+          onSelect={handleBatchEnhance}
         />
       )}
 
@@ -373,7 +434,7 @@ export default function App() {
       {/* Main Content */}
       <main className="flex-1 max-w-7xl w-full mx-auto px-4 py-8">
         
-        {/* State 1: Project Setup (Upload) */}
+        {/* State 1: Project Setup */}
         {!videoUrl && (
           <div className="flex flex-col items-center justify-center h-[70vh]">
             <div className="w-full max-w-lg bg-gray-900 border border-gray-800 rounded-3xl p-8 shadow-2xl relative overflow-hidden">
@@ -396,6 +457,7 @@ export default function App() {
                     <input type="file" accept="video/*" onChange={handleFileChange} className="absolute inset-0 w-full h-full opacity-0 cursor-pointer" />
                  </div>
                </div>
+               <p className="mt-4 text-xs text-gray-500 text-center">Drag and drop supported.</p>
             </div>
           </div>
         )}
@@ -412,30 +474,38 @@ export default function App() {
                   <div className="flex items-center gap-4 flex-wrap">
                       {videoUrl !== 'restored' && !isExtracting && frames.length === 0 ? (
                          <>
-                           <div className="flex items-center gap-2 bg-gray-800 rounded-lg p-1 border border-gray-700">
-                              <select 
-                                className="bg-transparent text-xs text-white outline-none px-2 py-1"
-                                value={scanSettings.range}
-                                onChange={e => setScanSettings({...scanSettings, range: e.target.value as any})}
-                              >
-                                <option value="full">Full Video</option>
-                                <option value="first_half">First Half</option>
-                                <option value="second_half">Second Half</option>
-                                <option value="q1">Q1 (0-25%)</option>
-                                <option value="q2">Q2 (25-50%)</option>
-                                <option value="q3">Q3 (50-75%)</option>
-                                <option value="q4">Q4 (75-100%)</option>
-                              </select>
-                              <div className="w-px h-4 bg-gray-600"></div>
-                              <select 
-                                className="bg-transparent text-xs text-white outline-none px-2 py-1"
-                                value={scanSettings.interval}
-                                onChange={e => setScanSettings({...scanSettings, interval: parseInt(e.target.value)})}
-                              >
-                                <option value={1}>Every 1s</option>
-                                <option value={3}>Every 3s</option>
-                                <option value={5}>Every 5s</option>
-                              </select>
+                           <div className="flex items-center gap-4">
+                              {videoDuration > 0 && (
+                                <div className="text-xs font-mono text-gray-400 bg-gray-800 px-2 py-1 rounded">
+                                   Duration: <span className="text-white">{formatDuration(videoDuration)}</span>
+                                </div>
+                              )}
+                              <div className="flex items-center gap-2 bg-gray-800 rounded-lg p-1 border border-gray-700">
+                                <select 
+                                  className="bg-transparent text-xs text-white outline-none px-2 py-1"
+                                  value={scanSettings.range}
+                                  onChange={e => setScanSettings({...scanSettings, range: e.target.value as any})}
+                                >
+                                  <option value="full">Full Video</option>
+                                  <option value="first_half">First Half</option>
+                                  <option value="second_half">Second Half</option>
+                                  <option value="q1">Q1 (0-25%)</option>
+                                  <option value="q2">Q2 (25-50%)</option>
+                                  <option value="q3">Q3 (50-75%)</option>
+                                  <option value="q4">Q4 (75-100%)</option>
+                                </select>
+                                <div className="w-px h-4 bg-gray-600"></div>
+                                <select 
+                                  className="bg-transparent text-xs text-white outline-none px-2 py-1"
+                                  value={scanSettings.interval}
+                                  onChange={e => setScanSettings({...scanSettings, interval: parseInt(e.target.value)})}
+                                >
+                                  <option value={1}>Every 1s</option>
+                                  <option value={2}>Every 2s</option>
+                                  <option value={3}>Every 3s</option>
+                                  <option value={5}>Every 5s</option>
+                                </select>
+                              </div>
                            </div>
 
                            <Button 
@@ -446,15 +516,20 @@ export default function App() {
                            </Button>
                          </>
                       ) : isExtracting ? (
-                          <div className="text-sm text-blue-400 font-mono animate-pulse">
-                              Scanning {Math.round(extractionProgress)}% ...
+                          <div className="text-sm text-blue-400 font-mono animate-pulse font-bold">
+                              System Busy...
                           </div>
                       ) : (
                           <div className="flex items-center gap-3">
-                            <Button variant="secondary" size="sm" onClick={() => { 
-                                 if(confirm("Clear frames and rescan?")) {
+                            <Button variant="secondary" size="sm" onClick={async () => { 
+                                 if(confirm("Clear frames and start over?")) {
                                    setFrames([]); 
-                                   localStorage.removeItem(STORAGE_KEY);
+                                   setFilters({ minQuality: 'All', shotType: 'All', activeTags: [] });
+                                   await clearProject();
+                                   if (videoUrl === 'restored') {
+                                      setVideoUrl(null);
+                                      setProjectName('My Project');
+                                   }
                                  }
                               }}>
                               New Scan
@@ -464,13 +539,23 @@ export default function App() {
                   </div>
 
                   {/* Right: Toggle Filters */}
-                  <button 
-                    onClick={() => setShowFilters(!showFilters)}
-                    className={`text-sm font-medium flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${showFilters ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white'}`}
-                  >
-                    <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>
-                    {showFilters ? 'Hide Filters' : 'Show Filters'}
-                  </button>
+                  <div className="flex items-center gap-3">
+                    <button 
+                      onClick={() => setLibraryView(libraryView === 'all' ? 'library' : 'all')}
+                      className={`text-sm font-medium flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${libraryView === 'library' ? 'bg-green-900/50 text-green-400 border border-green-800' : 'text-gray-400 hover:text-white'}`}
+                    >
+                       <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M5 5a2 2 0 012-2h10a2 2 0 012 2v16l-7-3.5L5 21V5z" /></svg>
+                       View Library ({stats.keepers})
+                    </button>
+
+                    <button 
+                      onClick={() => setShowFilters(!showFilters)}
+                      className={`text-sm font-medium flex items-center gap-2 px-3 py-2 rounded-lg transition-colors ${showFilters ? 'bg-gray-800 text-white' : 'text-gray-400 hover:text-white'}`}
+                    >
+                      <svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 6V4m0 2a2 2 0 100 4m0-4a2 2 0 110 4m-6 8a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4m6 6v10m6-2a2 2 0 100-4m0 4a2 2 0 110-4m0 4v2m0-6V4" /></svg>
+                      {showFilters ? 'Hide Filters' : 'Show Filters'}
+                    </button>
+                  </div>
                </div>
 
                {/* Expandable Filter Drawer */}
@@ -522,11 +607,54 @@ export default function App() {
                )}
             </div>
 
+            {/* PIPELINE VISUALIZATION */}
+            {(isExtracting || stats.analyzedFrames < stats.totalFrames) && (
+                <PipelineStatus 
+                   isExtracting={isExtracting}
+                   extractionProgress={extractionProgress}
+                   analyzedCount={stats.analyzedFrames}
+                   totalFrames={stats.totalFrames}
+                   isProcessing={stats.analyzedFrames < stats.totalFrames}
+                />
+            )}
+
             {/* Gallery */}
             <div>
-              <div className="flex items-center justify-between mb-4">
-                 <h2 className="text-lg font-bold text-white">Extracted Library</h2>
-                 <span className="text-xs text-gray-500 font-mono">Showing {filteredFrames.length} frames</span>
+              <div className="flex flex-col md:flex-row md:items-end justify-between mb-4 gap-4">
+                 <div className="flex flex-col">
+                    <h2 className="text-lg font-bold text-white flex items-center gap-2">
+                      {libraryView === 'library' ? 'Your Keepers' : 'Extracted Library'}
+                      {/* Scan Range Label */}
+                      {!isExtracting && frames.length > 0 && (
+                          <span className="text-xs font-mono font-normal text-gray-500 bg-gray-900 border border-gray-800 px-2 py-0.5 rounded ml-2">
+                             {getScanRangeLabel()}
+                          </span>
+                      )}
+                    </h2>
+                    <span className="text-xs text-gray-500 font-mono mt-1">Showing {filteredFrames.length} frames</span>
+                 </div>
+
+                 {/* Library Filters */}
+                 <div className="flex items-center bg-gray-900 p-1 rounded-lg border border-gray-800">
+                     <button 
+                       onClick={() => setLibraryFilter('all')}
+                       className={`text-xs px-3 py-1 rounded-md transition-all ${libraryFilter === 'all' ? 'bg-gray-700 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                     >
+                       All
+                     </button>
+                     <button 
+                       onClick={() => setLibraryFilter('original')}
+                       className={`text-xs px-3 py-1 rounded-md transition-all ${libraryFilter === 'original' ? 'bg-gray-700 text-white shadow' : 'text-gray-400 hover:text-white'}`}
+                     >
+                       Originals
+                     </button>
+                     <button 
+                       onClick={() => setLibraryFilter('enhanced')}
+                       className={`text-xs px-3 py-1 rounded-md transition-all ${libraryFilter === 'enhanced' ? 'bg-purple-900/50 text-purple-300 shadow border border-purple-500/30' : 'text-gray-400 hover:text-purple-300'}`}
+                     >
+                       Enhanced
+                     </button>
+                 </div>
               </div>
 
               <div className="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-4 xl:grid-cols-5 gap-4">
@@ -538,7 +666,7 @@ export default function App() {
                       onClick={(f) => setSelectedFrameId(f.id)}
                       onEnhanceClick={(f, e) => {
                           e.stopPropagation();
-                          setEnhancingFrameId(f.id);
+                          setSelectedFrameId(f.id);
                       }}
                     />
                   ))}
@@ -546,7 +674,7 @@ export default function App() {
               
               {filteredFrames.length === 0 && !isExtracting && (
                   <div className="flex flex-col items-center justify-center py-20 text-gray-500">
-                     No frames found.
+                     {libraryView === 'library' ? 'No keepers selected yet.' : 'No frames match filters.'}
                   </div>
               )}
             </div>

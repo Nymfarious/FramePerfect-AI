@@ -337,6 +337,20 @@ export default function App() {
     }
   };
 
+  const handleNewScan = async () => {
+    if (confirm("This will clear the current project and start over. Are you sure?")) {
+      // Clear all state to return to the initial screen
+      setFrames([]);
+      setFilters({ minQuality: 'All', shotType: 'All', activeTags: [] });
+      await clearProject();
+      setVideoFile(null);
+      setVideoUrl(null);
+      setVideoDuration(0);
+      setProjectName('My Project');
+      setSelectedFrameId(null);
+    }
+  };
+
   const filteredFrames = frames.filter(frame => {
     // 1. Library View Filter (Keepers Only)
     if (libraryView === 'library') {
@@ -521,17 +535,7 @@ export default function App() {
                           </div>
                       ) : (
                           <div className="flex items-center gap-3">
-                            <Button variant="secondary" size="sm" onClick={async () => { 
-                                 if(confirm("Clear frames and start over?")) {
-                                   setFrames([]); 
-                                   setFilters({ minQuality: 'All', shotType: 'All', activeTags: [] });
-                                   await clearProject();
-                                   if (videoUrl === 'restored') {
-                                      setVideoUrl(null);
-                                      setProjectName('My Project');
-                                   }
-                                 }
-                              }}>
+                            <Button variant="secondary" size="sm" onClick={handleNewScan}>
                               New Scan
                             </Button>
                           </div>
